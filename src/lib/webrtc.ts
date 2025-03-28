@@ -1,5 +1,13 @@
 import { supabase } from './supabase';
 
+// Add type declarations for legacy media methods
+declare global {
+  interface Navigator {
+    webkitGetUserMedia?: (constraints: MediaStreamConstraints, successCallback: (stream: MediaStream) => void, errorCallback: (error: Error) => void) => void;
+    mozGetUserMedia?: (constraints: MediaStreamConstraints, successCallback: (stream: MediaStream) => void, errorCallback: (error: Error) => void) => void;
+  }
+}
+
 export class WebRTCService {
   private peerConnection: RTCPeerConnection | null = null;
   private localStream: MediaStream | null = null;
@@ -11,9 +19,26 @@ export class WebRTCService {
       throw new Error('WebRTCService must be used in a browser environment');
     }
 
-    // Check if MediaDevices API is available
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('MediaDevices API is not supported in this browser');
+    // Initialize mediaDevices if it doesn't exist
+    if (!navigator.mediaDevices) {
+      // @ts-ignore - This is a polyfill for older browsers
+      navigator.mediaDevices = {};
+    }
+
+    // Add getUserMedia polyfill for older browsers
+    if (!navigator.mediaDevices.getUserMedia) {
+      // @ts-ignore - This is a polyfill for older browsers
+      navigator.mediaDevices.getUserMedia = function(constraints) {
+        const getUserMedia = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+        
+        if (!getUserMedia) {
+          return Promise.reject(new Error('getUserMedia is not implemented in this browser'));
+        }
+
+        return new Promise((resolve, reject) => {
+          getUserMedia.call(navigator, constraints, resolve, reject);
+        });
+      };
     }
 
     // Check if we're in a secure context (HTTPS or localhost)
@@ -60,6 +85,9 @@ export class WebRTCService {
           autoGainControl: true
         } : false
       };
+
+      // Add a small delay to ensure the browser has initialized mediaDevices
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
 
