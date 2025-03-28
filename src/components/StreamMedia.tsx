@@ -23,7 +23,18 @@ interface StreamMediaProps {
 const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [webrtc] = useState(() => new WebRTCService());
+  const [webrtc] = useState(() => {
+    try {
+      return new WebRTCService();
+    } catch (error) {
+      if (error instanceof Error) {
+        setError(error.message);
+      } else {
+        setError('Failed to initialize WebRTC service');
+      }
+      return null;
+    }
+  });
   const [isMicEnabled, setIsMicEnabled] = useState(true);
   const [isCameraEnabled, setIsCameraEnabled] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -56,6 +67,11 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
 
   // Request permissions explicitly
   const requestMediaPermissions = useCallback(async () => {
+    if (!webrtc) {
+      setError('WebRTC service is not initialized');
+      return;
+    }
+
     setIsLoading(true);
     setError(null);
     setShowPermissionDialog(false);
@@ -79,7 +95,11 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
       
     } catch (err) {
       console.error('Error accessing media devices:', err);
-      setError('Could not access camera or microphone. Please check permissions in your browser settings.');
+      if (err instanceof Error) {
+        setError(err.message);
+      } else {
+        setError('Could not access camera or microphone. Please check permissions in your browser settings.');
+      }
       setShowPermissionDialog(true);
     } finally {
       setIsLoading(false);
@@ -88,6 +108,8 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
 
   // Initialize media stream if not in viewer mode
   useEffect(() => {
+    if (!webrtc) return;
+
     if (viewerMode) {
       setError(null);
       setIsStreamActive(true);
@@ -244,7 +266,7 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
               <Button 
                 onClick={requestMediaPermissions} 
                 className="gap-2"
-                disabled={isLoading}
+                disabled={isLoading || !webrtc}
               >
                 <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
                 Try Again

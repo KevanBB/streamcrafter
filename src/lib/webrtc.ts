@@ -6,6 +6,21 @@ export class WebRTCService {
   private remoteStream: MediaStream | null = null;
 
   constructor() {
+    // Check if we're in a browser environment
+    if (typeof window === 'undefined') {
+      throw new Error('WebRTCService must be used in a browser environment');
+    }
+
+    // Check if MediaDevices API is available
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('MediaDevices API is not supported in this browser');
+    }
+
+    // Check if we're in a secure context (HTTPS or localhost)
+    if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
+      throw new Error('MediaDevices API requires a secure context (HTTPS or localhost)');
+    }
+
     this.peerConnection = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' }
@@ -27,10 +42,26 @@ export class WebRTCService {
 
   async startLocalStream(video: boolean, audio: boolean): Promise<MediaStream> {
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
-        video,
-        audio
-      });
+      // Double check MediaDevices API availability
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('MediaDevices API is not supported in this browser');
+      }
+
+      // Request permissions with specific constraints
+      const constraints: MediaStreamConstraints = {
+        video: video ? {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 }
+        } : false,
+        audio: audio ? {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } : false
+      };
+
+      this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
 
       // Add tracks to peer connection
       this.localStream.getTracks().forEach(track => {
@@ -42,6 +73,15 @@ export class WebRTCService {
       return this.localStream;
     } catch (error) {
       console.error('Error accessing media devices:', error);
+      if (error instanceof Error) {
+        if (error.name === 'NotAllowedError') {
+          throw new Error('Camera and microphone access was denied. Please allow access in your browser settings.');
+        } else if (error.name === 'NotFoundError') {
+          throw new Error('No camera or microphone found. Please connect a device and try again.');
+        } else if (error.name === 'NotReadableError') {
+          throw new Error('Camera or microphone is already in use by another application.');
+        }
+      }
       throw error;
     }
   }
