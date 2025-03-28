@@ -1,10 +1,11 @@
-
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Mic, MicOff, Video, VideoOff, RefreshCw, Eye, Camera, Play } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useToast } from "@/hooks/use-toast";
+import { WebRTCService } from '@/lib/webrtc';
+import { supabase } from '@/lib/supabase';
 import { 
   Dialog,
   DialogContent,
@@ -22,31 +23,36 @@ interface StreamMediaProps {
 const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [webrtc] = useState(() => new WebRTCService());
   const [isMicEnabled, setIsMicEnabled] = useState(true);
   const [isCameraEnabled, setIsCameraEnabled] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [showPermissionDialog, setShowPermissionDialog] = useState(false);
   const [isStreamActive, setIsStreamActive] = useState(false);
-  const [mockViewerCount, setMockViewerCount] = useState(0);
   const { toast } = useToast();
 
-  // Initialize mock viewer count
+  // Subscribe to ICE candidates
   useEffect(() => {
-    if (isStreamActive) {
-      const interval = setInterval(() => {
-        // Randomly increment or decrement viewer count (1-20 range)
-        setMockViewerCount(prev => {
-          const change = Math.floor(Math.random() * 3) - 1; // -1, 0, or 1
-          const newCount = Math.max(1, Math.min(20, prev + change));
-          return newCount;
-        });
-      }, 5000);
-      
-      return () => clearInterval(interval);
-    }
-  }, [isStreamActive]);
+    if (!roomId) return;
+
+    const subscription = supabase
+      .channel(`ice_candidates:${roomId}`)
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'ice_candidates',
+        filter: `room_id=eq.${roomId}`
+      }, async (payload) => {
+        const candidate = JSON.parse(payload.new.candidate);
+        await webrtc.handleIceCandidate(candidate);
+      })
+      .subscribe();
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [roomId, webrtc]);
 
   // Request permissions explicitly
   const requestMediaPermissions = useCallback(async () => {
@@ -55,24 +61,7 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
     setShowPermissionDialog(false);
     
     try {
-      // First just check if permissions are already granted
-      const permissions = await navigator.permissions.query({ 
-        name: 'camera' as PermissionName 
-      });
-      
-      if (permissions.state === 'denied') {
-        setError('Permission for camera/microphone has been denied. Please enable in your browser settings.');
-        setShowPermissionDialog(true);
-        return;
-      }
-      
-      // Actually request the media stream
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: isCameraEnabled,
-        audio: isMicEnabled
-      });
-      
-      setStream(mediaStream);
+      const mediaStream = await webrtc.startLocalStream(isCameraEnabled, isMicEnabled);
       
       if (videoRef.current) {
         videoRef.current.srcObject = mediaStream;
@@ -95,32 +84,26 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
     } finally {
       setIsLoading(false);
     }
-  }, [isCameraEnabled, isMicEnabled, toast, isStreamActive]);
+  }, [isCameraEnabled, isMicEnabled, toast, isStreamActive, webrtc]);
 
   // Initialize media stream if not in viewer mode
   useEffect(() => {
     if (viewerMode) {
       setError(null);
-      setIsStreamActive(true); // Start mock stream for viewers
+      setIsStreamActive(true);
       return;
     }
     
-    // Show permission dialog on component mount
-    if (!stream) {
+    if (!webrtc.getLocalStream()) {
       setShowPermissionDialog(true);
     }
     
-    // Cleanup function
     return () => {
-      if (stream) {
-        stream.getTracks().forEach(track => {
-          track.stop();
-        });
-      }
+      webrtc.stop();
     };
-  }, [viewerMode, stream]);
-  
-  // Audio visualization for mock streaming
+  }, [viewerMode, webrtc]);
+
+  // Audio visualization
   const startAudioVisualization = (mediaStream: MediaStream) => {
     if (!canvasRef.current) return;
     
@@ -175,6 +158,7 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
 
   // Toggle microphone
   const toggleMic = () => {
+    const stream = webrtc.getLocalStream();
     if (stream) {
       stream.getAudioTracks().forEach(track => {
         track.enabled = !isMicEnabled;
@@ -190,6 +174,7 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
 
   // Toggle camera
   const toggleCamera = () => {
+    const stream = webrtc.getLocalStream();
     if (stream) {
       stream.getVideoTracks().forEach(track => {
         track.enabled = !isCameraEnabled;
@@ -204,27 +189,45 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
   };
 
   // Start/stop streaming
-  const toggleStreaming = () => {
+  const toggleStreaming = async () => {
     if (isStreamActive) {
       setIsStreamActive(false);
+      webrtc.stop();
       toast({
         title: "Stream Ended",
         description: "Your stream has been stopped",
       });
     } else {
-      setIsStreamActive(true);
-      if (stream) {
+      try {
+        const stream = await webrtc.startLocalStream(isCameraEnabled, isMicEnabled);
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+        setIsStreamActive(true);
         startAudioVisualization(stream);
+        
+        // Create and send offer if we're the broadcaster
+        if (!viewerMode && roomId) {
+          const offer = await webrtc.createOffer();
+          await supabase
+            .from('stream_offers')
+            .insert([{ room_id: roomId, offer: JSON.stringify(offer) }]);
+        }
+        
+        toast({
+          title: "Stream Started",
+          description: "You are now live!",
+        });
+      } catch (err) {
+        console.error('Error starting stream:', err);
+        toast({
+          title: "Error",
+          description: "Failed to start stream. Please try again.",
+          variant: "destructive",
+        });
       }
-      toast({
-        title: "Stream Started",
-        description: "You are now live!",
-      });
     }
   };
-
-  // Switch to viewer mode
-  const enableViewerMode = () => window.location.search = '?viewerMode=true';
 
   return (
     <Card className="overflow-hidden bg-stream-gray border-stream-gray">
@@ -246,134 +249,68 @@ const StreamMedia: React.FC<StreamMediaProps> = ({ roomId, viewerMode = false })
                 <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
                 Try Again
               </Button>
-              
-              <Button 
-                onClick={enableViewerMode}
-                variant="outline" 
-                className="gap-2"
-              >
-                <Eye className="h-4 w-4" />
-                Continue as Viewer
-              </Button>
             </div>
-          </div>
-        ) : viewerMode ? (
-          <div className="absolute inset-0 flex items-center justify-center bg-stream-dark">
-            {isStreamActive ? (
-              <div className="text-center w-full h-full flex flex-col items-center justify-center">
-                <div className="w-full h-full relative">
-                  <canvas ref={canvasRef} width="640" height="360" className="w-full h-full" />
-                  <div className="absolute bottom-4 right-4 bg-stream-purple/30 text-white px-2 py-1 rounded-md text-sm flex items-center">
-                    <Eye className="h-4 w-4 mr-1" /> {mockViewerCount}
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="text-center p-6">
-                <Eye className="h-12 w-12 mx-auto mb-4 text-stream-purple opacity-50" />
-                <h3 className="text-xl font-medium mb-2">Waiting for Stream</h3>
-                <p className="text-sm text-stream-light opacity-75 max-w-md">
-                  The streamer hasn't started broadcasting yet. The stream will appear here once it begins.
-                </p>
-              </div>
-            )}
           </div>
         ) : (
           <>
-            <video 
-              ref={videoRef} 
-              autoPlay 
-              playsInline 
-              muted 
-              className={`w-full h-full object-cover ${!isCameraEnabled || !isStreamActive ? 'hidden' : ''}`}
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted={!viewerMode}
+              className="w-full h-full object-cover"
             />
-            <canvas 
-              ref={canvasRef} 
-              width="640" 
-              height="360" 
-              className={`w-full h-full ${!isStreamActive || isCameraEnabled ? 'hidden' : ''}`} 
+            <canvas
+              ref={canvasRef}
+              className="absolute bottom-0 left-0 w-full h-16 opacity-50"
+              width={800}
+              height={64}
             />
           </>
         )}
         
-        {(!isCameraEnabled || !isStreamActive) && !error && !viewerMode && (
-          <div className="absolute inset-0 flex items-center justify-center bg-stream-dark">
-            <div className="text-center">
-              {!isStreamActive ? (
-                <>
-                  <Camera className="h-12 w-12 mx-auto mb-4 text-stream-purple opacity-50" />
-                  <h3 className="text-xl font-medium mb-2">Ready to Stream</h3>
-                  <p className="text-sm text-stream-light opacity-75 max-w-md mb-4">
-                    Click the Start Streaming button below to go live.
-                  </p>
-                </>
-              ) : (
-                <div className="text-stream-light text-xl font-medium">Camera is off</div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {!viewerMode && (
-          <>
-            <div className="absolute bottom-4 left-0 right-0 flex justify-center gap-2">
-              <Button 
-                variant="outline" 
-                size="icon" 
-                onClick={toggleMic} 
-                className={`rounded-full bg-stream-gray/80 border-0 hover:bg-stream-purple ${!isMicEnabled ? 'bg-red-500/80 hover:bg-red-600' : ''}`}
-                disabled={!stream || !isStreamActive}
-              >
-                {isMicEnabled ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
-              </Button>
-              
-              <Button 
-                variant="outline" 
-                size="icon" 
-                onClick={toggleCamera} 
-                className={`rounded-full bg-stream-gray/80 border-0 hover:bg-stream-purple ${!isCameraEnabled ? 'bg-red-500/80 hover:bg-red-600' : ''}`}
-                disabled={!stream || !isStreamActive}
-              >
-                {isCameraEnabled ? <Video className="h-5 w-5" /> : <VideoOff className="h-5 w-5" />}
-              </Button>
-              
-              <Button
-                onClick={toggleStreaming}
-                className={`rounded-full ${isStreamActive ? 'bg-red-500 hover:bg-red-600' : 'bg-stream-purple hover:bg-stream-purple/80'} border-0 px-4`}
-                disabled={!stream}
-              >
-                {isStreamActive ? 'End Stream' : 'Start Streaming'}
-              </Button>
-            </div>
-            
-            {isStreamActive && (
-              <div className="absolute top-4 right-4 bg-stream-purple/30 text-white px-2 py-1 rounded-md text-sm flex items-center">
-                <Eye className="h-4 w-4 mr-1" /> {mockViewerCount}
-              </div>
-            )}
-          </>
-        )}
+        <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 flex gap-2">
+          <Button
+            onClick={toggleMic}
+            variant="secondary"
+            size="icon"
+            className="rounded-full bg-stream-dark/80 hover:bg-stream-dark"
+          >
+            {isMicEnabled ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
+          </Button>
+          
+          <Button
+            onClick={toggleCamera}
+            variant="secondary"
+            size="icon"
+            className="rounded-full bg-stream-dark/80 hover:bg-stream-dark"
+          >
+            {isCameraEnabled ? <Video className="h-5 w-5" /> : <VideoOff className="h-5 w-5" />}
+          </Button>
+          
+          <Button
+            onClick={toggleStreaming}
+            variant="secondary"
+            size="icon"
+            className="rounded-full bg-stream-dark/80 hover:bg-stream-dark"
+          >
+            {isStreamActive ? <Play className="h-5 w-5" /> : <Camera className="h-5 w-5" />}
+          </Button>
+        </div>
       </div>
-      
-      {/* Permission Dialog */}
+
       <Dialog open={showPermissionDialog} onOpenChange={setShowPermissionDialog}>
-        <DialogContent className="bg-stream-gray text-white border-stream-dark">
+        <DialogContent>
           <DialogHeader>
-            <DialogTitle>Allow Camera & Microphone Access</DialogTitle>
-            <DialogDescription className="text-stream-light">
-              This app needs permission to use your camera and microphone for streaming. Please allow access when prompted by your browser.
+            <DialogTitle>Camera & Microphone Access</DialogTitle>
+            <DialogDescription>
+              StreamCrafter needs access to your camera and microphone to enable streaming.
+              Please allow access in your browser settings.
             </DialogDescription>
           </DialogHeader>
-          <div className="flex justify-center py-4">
-            <Camera className="h-16 w-16 text-stream-purple mx-2" />
-            <Mic className="h-16 w-16 text-stream-purple mx-2" />
-          </div>
           <DialogFooter>
-            <Button onClick={requestMediaPermissions} className="w-full streaming-gradient">
-              <Camera className="h-4 w-4 mr-2" /> Request Permissions
-            </Button>
-            <Button onClick={enableViewerMode} variant="outline" className="w-full mt-2">
-              <Eye className="h-4 w-4 mr-2" /> Continue as Viewer
+            <Button onClick={requestMediaPermissions}>
+              Allow Access
             </Button>
           </DialogFooter>
         </DialogContent>
